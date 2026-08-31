@@ -31,8 +31,19 @@ SESSIONS_DIR = CLAUDE_DIR / "sessions"
 PROJECTS = CLAUDE_DIR / "projects"
 REFRESH_SECONDS = 1.5
 
-CTX_WARN = 120_000
-CTX_CRIT = 170_000
+# Native context window per model (Anthropic API). Source: code.claude.com/docs/en/model-config
+# Sonnet 5 / Opus 5 / Fable 5 run 1M natively with no special config; everything else defaults to
+# 200K unless it's running with a "[1m]" suffix, which we can't see from the transcript so we don't
+# try to detect it. DEFAULT_CTX_LIMIT covers any model name not in this table (older/unknown models).
+MODEL_CONTEXT_WINDOWS = {
+    "claude-sonnet-5": 1_000_000,
+    "claude-opus-5": 1_000_000,
+    "claude-fable-5": 1_000_000,
+}
+DEFAULT_CTX_LIMIT = 200_000
+
+CTX_WARN_RATIO = 0.60  # fraction of the model's context window
+CTX_CRIT_RATIO = 0.85  # Claude Code itself auto-compacts around ~0.967 of the window
 LOWCACHE_MIN_CTX = 20_000
 LOWCACHE_RATIO = 0.4
 LOOP_RUN_LEN = 4
@@ -101,6 +112,7 @@ class SessionState:
         self.last_cache_read = 0
         self.last_cache_creation = 0
         self.has_usage = False  # True once we've seen a real assistant usage entry
+        self.compact_pending = False  # True from a /compact marker until the next real usage entry
         self.last_msg_ts_ms = None
         self.created_ms = None
         self.last_tool = None
@@ -167,11 +179,18 @@ class SessionState:
                     # real context itself. Reset our own counters now so the display isn't stuck
                     # showing the pre-clear numbers in the meantime.
                     self._reset_for_clear()
+                if d.get("type") == "user" and "<command-name>/compact</command-name>" in _msg_text(msg):
+                    # /compact rewrites history into a summary, but (unlike /clear) we have no way
+                    # to know the new context size until the next real usage entry arrives — mark
+                    # the current numbers as stale/pending instead of guessing or leaving them look
+                    # accurate.
+                    self.compact_pending = True
                 if msg.get("model"):
                     self.model = msg["model"]
                 u = msg.get("usage")
                 if u:
                     self.has_usage = True
+                    self.compact_pending = False
                     self.total_output += u.get("output_tokens", 0) or 0
                     # context_tokens is a snapshot of the LAST turn only — cache_read/creation/input
                     # together represent that turn's full context. Do NOT accumulate across turns,
@@ -203,6 +222,18 @@ class SessionState:
         return self.last_cache_read + self.last_cache_creation + self.last_input_tokens
 
     @property
+    def ctx_limit(self) -> int:
+        """Native context window for this session's model, or a conservative default if unknown."""
+        return MODEL_CONTEXT_WINDOWS.get(self.model, DEFAULT_CTX_LIMIT)
+
+    @property
+    def ctx_pct(self):
+        """Percentage of the model's context window used by the last turn, or None with no data yet."""
+        if not self.has_usage:
+            return None
+        return self.context_tokens / self.ctx_limit * 100
+
+    @property
     def cache_ratio(self):
         """Fraction of the last turn's context served from cache, or None if no turn has happened yet."""
         if not self.has_usage:
@@ -222,10 +253,12 @@ class SessionState:
     def warnings(self):
         """Plain-language list of (severity, message) — severity is 'crit' or 'warn'."""
         out = []
-        if self.context_tokens >= CTX_CRIT:
-            out.append(("crit", f"Context is very large ({fmt_k(self.context_tokens)} tokens) — consider a fresh session"))
-        elif self.context_tokens >= CTX_WARN:
-            out.append(("warn", f"Context is getting big ({fmt_k(self.context_tokens)} tokens)"))
+        if self.compact_pending:
+            out.append(("warn", "/compact ran — CTX/%LIM below are stale until the next real turn"))
+        if self.ctx_pct is not None and self.ctx_pct >= CTX_CRIT_RATIO * 100:
+            out.append(("crit", f"Context is very large ({fmt_k(self.context_tokens)} tokens, {self.ctx_pct:.0f}% of {fmt_k(self.ctx_limit)}) — consider a fresh session"))
+        elif self.ctx_pct is not None and self.ctx_pct >= CTX_WARN_RATIO * 100:
+            out.append(("warn", f"Context is getting big ({fmt_k(self.context_tokens)} tokens, {self.ctx_pct:.0f}% of {fmt_k(self.ctx_limit)})"))
         if self.is_looping:
             out.append(("crit", f"Repeating the exact same {self.recent_tools[-1][0]} call — looks stuck in a loop"))
         if self.tool_errors:
@@ -333,10 +366,21 @@ def cmux_send_command(session_id: str, text: str):
     loc = cmux_find_surface(session_id)
     if not loc:
         return False, "Not found in cmux (not running in a cmux pane, or already closed)"
-    ok, msg = cmux_run("send", "--workspace", loc["workspace_ref"], "--surface", loc["surface_ref"], text)
+    ws, sf = loc["workspace_ref"], loc["surface_ref"]
+    # `send` just types at the current cursor position — it does NOT clear existing input.
+    # If the box already had leftover text (e.g. an untyped/aborted command), our text would
+    # just get appended onto it (observed: sending "/clear" produced "/clear/clear" because
+    # the box already had "/clear" sitting in it). Clear the line both directions first.
+    ok, msg = cmux_run("send-key", "--workspace", ws, "--surface", sf, "ctrl+u")
+    if not ok:
+        return False, f"clear-line failed: {msg}"
+    ok, msg = cmux_run("send-key", "--workspace", ws, "--surface", sf, "ctrl+k")
+    if not ok:
+        return False, f"clear-line failed: {msg}"
+    ok, msg = cmux_run("send", "--workspace", ws, "--surface", sf, text)
     if not ok:
         return False, f"send failed: {msg}"
-    ok, msg = cmux_run("send-key", "--workspace", loc["workspace_ref"], "--surface", loc["surface_ref"], "Enter")
+    ok, msg = cmux_run("send-key", "--workspace", ws, "--surface", sf, "Enter")
     if not ok:
         return False, f"enter failed: {msg}"
     return True, f"Sent {text}"
@@ -368,7 +412,7 @@ def draw(stdscr):
     prev_show_help = False
     stdscr.timeout(100)  # getch blocks up to 100ms — keeps nav responsive between data refreshes
 
-    col_headers = ["NAME", "STATUS", "CTX", "CACHE%", "OUT", "!", "LAST MSG", "CREATED"]
+    col_headers = ["NAME", "STATUS", "CTX", "%LIM", "OUT", "!", "LAST MSG", "CREATED"]
     widths = [16, 8, 8, 7, 8, 3, 9, 9]
 
     HELP_LINES = [
@@ -380,7 +424,11 @@ def draw(stdscr):
         ("", 0),
         ("Columns", curses.A_BOLD),
         ("  CTX        Context size of the LAST turn (cache_read + cache_creation + input).", 0),
-        ("  CACHE%     Share of that turn's context served from prompt cache. '-' = no turn yet.", 0),
+        ("  %LIM       CTX as a % of this session's model's context window (1M for Sonnet/Opus/", 0),
+        ("             Fable 5, 200K default otherwise). THIS is the number to watch for compacting —", 0),
+        ("             not cache hit rate. '-' = no turn yet. Row turns yellow at 60%, red at 85%.", 0),
+        ("             A trailing '?' on CTX, or '?' in %LIM, means /compact ran but the session", 0),
+        ("             hasn't had a real turn since — the numbers are stale until it does.", 0),
         ("  OUT        Total output tokens generated this session.", 0),
         ("  !          Number of active warnings (see the detail panel below for what they are).", 0),
         ("  LAST MSG   Time since the last real conversation turn (not process uptime).", 0),
@@ -513,8 +561,10 @@ def draw(stdscr):
             vals = [
                 st.name,
                 st.status,
-                fmt_k(st.context_tokens),
-                f"{st.cache_ratio * 100:.0f}%" if st.cache_ratio is not None else "-",
+                f"{fmt_k(st.context_tokens)}?" if st.compact_pending else fmt_k(st.context_tokens),
+                "?" if st.compact_pending else (
+                    f"{st.ctx_pct:.0f}%" if st.ctx_pct is not None else "-"
+                ),
                 fmt_k(st.total_output),
                 str(len(warn)) if warn else "-",
                 ago_str(st.last_msg_ts_ms) if st.last_msg_ts_ms else "-",
@@ -533,9 +583,11 @@ def draw(stdscr):
         if sel:
             safe_addstr(stdscr, drow, 0, f"{sel.name}  ({sel.status})"[: w_ - 1], curses.A_BOLD)
             drow += 1
+            cache_str = f"{sel.cache_ratio * 100:.0f}%" if sel.cache_ratio is not None else "-"
             safe_addstr(
                 stdscr, drow, 0,
-                f"model: {(sel.model or '?').replace('claude-', '')}   pid: {sel.pid}   cwd: {sel.cwd}"[: w_ - 1],
+                f"model: {(sel.model or '?').replace('claude-', '')}   pid: {sel.pid}   "
+                f"cache hit: {cache_str}   cwd: {sel.cwd}"[: w_ - 1],
                 DIM,
             )
             drow += 1

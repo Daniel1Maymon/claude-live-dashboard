@@ -54,8 +54,8 @@ python3 claude_live_dashboard.py
 | Column | Meaning |
 |---|---|
 | `STATUS` | `idle`, `busy` (generating), `shell` (running a command), or `waiting` (blocked on a permission dialog) |
-| `CTX` | Context size of the *last* turn only (cache read + cache creation + input tokens) |
-| `CACHE%` | Share of that turn's context served from prompt cache (`-` if no turn has happened yet) |
+| `CTX` | Context size of the *last* turn only (cache read + cache creation + input tokens). A trailing `?` means `/compact` ran but there's been no turn since, so the number is stale. |
+| `%LIM` | `CTX` as a percentage of *this session's model's* real context window (1M for Sonnet/Opus/Fable 5, 200K default otherwise) — the number to actually watch for compacting. Yellow at 60%, red at 85%. |
 | `OUT` | Total output tokens generated so far this session |
 | `!` | Number of active warnings for that session |
 | `LAST MSG` | Time since the last real conversation turn |
