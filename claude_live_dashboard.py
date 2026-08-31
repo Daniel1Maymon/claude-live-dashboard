@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import subprocess
+import textwrap
 import time
 from collections import OrderedDict, deque
 from datetime import datetime
@@ -173,13 +174,18 @@ class SessionState:
                 msg = d.get("message")
                 if not isinstance(msg, dict):
                     continue
-                if d.get("type") == "user" and "<command-name>/clear</command-name>" in _msg_text(msg):
+                # A real slash-command invocation is the ENTIRE message content, nothing else —
+                # e.g. exactly "<command-name>/clear</command-name>\n  <command-message>...".
+                # Checking startswith (not "in") avoids false-triggering on text that merely
+                # mentions the marker, e.g. a compaction summary describing this very feature.
+                msg_text_stripped = _msg_text(msg).strip() if d.get("type") == "user" else ""
+                if msg_text_stripped.startswith("<command-name>/clear</command-name>"):
                     # /clear resets the model's context immediately, but the dashboard only learns
                     # the new (near-zero) size from the NEXT turn's usage stats — same lag as the
                     # real context itself. Reset our own counters now so the display isn't stuck
                     # showing the pre-clear numbers in the meantime.
                     self._reset_for_clear()
-                if d.get("type") == "user" and "<command-name>/compact</command-name>" in _msg_text(msg):
+                if msg_text_stripped.startswith("<command-name>/compact</command-name>"):
                     # /compact rewrites history into a summary, but (unlike /clear) we have no way
                     # to know the new context size until the next real usage entry arrives — mark
                     # the current numbers as stale/pending instead of guessing or leaving them look
@@ -357,7 +363,19 @@ def cmux_navigate(session_id: str):
     loc = cmux_find_surface(session_id)
     if not loc:
         return False, "Not found in cmux (not running in a cmux pane, or already closed)"
-    cmux_run("rpc", "surface.focus", json.dumps({"surface_id": loc["surface_uuid"]}))
+    # `rpc surface.focus` looks like the right tool (it's what a JSON body targeting a specific
+    # surface should be for) but it's silently broken: it always operates on the CALLING shell's
+    # own workspace/surface (same root bug as the rpc scoping quirk elsewhere in this file),
+    # so every navigation landed back on wherever the dashboard itself happened to be running —
+    # confirmed by testing it against several different real targets and watching it no-op every
+    # time. `select-workspace` + `focus-panel`, the purpose-built subcommands, reliably switch
+    # both the workspace AND the exact tab — verified against multiple real cross-workspace targets.
+    ok, msg = cmux_run("select-workspace", "--workspace", loc["workspace_ref"])
+    if not ok:
+        return False, f"select-workspace failed: {msg}"
+    ok, msg = cmux_run("focus-panel", "--panel", loc["surface_ref"], "--workspace", loc["workspace_ref"])
+    if not ok:
+        return False, f"focus-panel failed: {msg}"
     subprocess.run(["open", "-a", "cmux"], capture_output=True)  # best-effort: bring app to front
     return True, f"Switched to {loc['workspace_ref']} / {loc['surface_ref']} in cmux"
 
@@ -412,8 +430,8 @@ def draw(stdscr):
     prev_show_help = False
     stdscr.timeout(100)  # getch blocks up to 100ms — keeps nav responsive between data refreshes
 
-    col_headers = ["NAME", "STATUS", "CTX", "%LIM", "OUT", "!", "LAST MSG", "CREATED"]
-    widths = [16, 8, 8, 7, 8, 3, 9, 9]
+    col_headers = ["NAME", "STATUS", "CTX", "%LIM", "!", "LAST MSG", "CREATED"]
+    widths = [16, 8, 8, 7, 3, 9, 9]
 
     HELP_LINES = [
         ("STATUS values", curses.A_BOLD),
@@ -429,7 +447,6 @@ def draw(stdscr):
         ("             not cache hit rate. '-' = no turn yet. Row turns yellow at 60%, red at 85%.", 0),
         ("             A trailing '?' on CTX, or '?' in %LIM, means /compact ran but the session", 0),
         ("             hasn't had a real turn since — the numbers are stale until it does.", 0),
-        ("  OUT        Total output tokens generated this session.", 0),
         ("  !          Number of active warnings (see the detail panel below for what they are).", 0),
         ("  LAST MSG   Time since the last real conversation turn (not process uptime).", 0),
         ("  CREATED    Time since this terminal/process started (can predate LAST MSG on a", 0),
@@ -565,7 +582,6 @@ def draw(stdscr):
                 "?" if st.compact_pending else (
                     f"{st.ctx_pct:.0f}%" if st.ctx_pct is not None else "-"
                 ),
-                fmt_k(st.total_output),
                 str(len(warn)) if warn else "-",
                 ago_str(st.last_msg_ts_ms) if st.last_msg_ts_ms else "-",
                 ago_str(st.created_ms) if st.created_ms else "-",
@@ -591,6 +607,13 @@ def draw(stdscr):
                 DIM,
             )
             drow += 1
+            safe_addstr(
+                stdscr, drow, 0,
+                f"lifetime output: {fmt_k(sel.total_output)} tokens "
+                "(not context — includes anything discarded by past /compact runs)"[: w_ - 1],
+                DIM,
+            )
+            drow += 1
             created = f"{abs_str(sel.created_ms)} ({ago_str(sel.created_ms)} ago)" if sel.created_ms else "?"
             last_msg = f"{abs_str(sel.last_msg_ts_ms)} ({ago_str(sel.last_msg_ts_ms)} ago)" if sel.last_msg_ts_ms else "no messages yet"
             safe_addstr(stdscr, drow, 0, f"created: {created}   last message: {last_msg}"[: w_ - 1], DIM)
@@ -610,12 +633,16 @@ def draw(stdscr):
 
             drow += 1
             all_tools = sorted(sel.tools.items(), key=lambda kv: -kv[1])
-            skills_line_reserved = 1
+            skills_text = f"Skills used: {sel.all_skills()}"
+            skills_lines = textwrap.wrap(
+                skills_text, width=max(20, w_ - 1), subsequent_indent="  "
+            ) or [skills_text]
+            skills_line_reserved = len(skills_lines) + 1  # +1 for the blank line before it
             if all_tools:
                 header_row = drow
                 drow += 1
                 list_start = drow
-                list_end = h - 1 - skills_line_reserved  # leave room for the skills line
+                list_end = h - skills_line_reserved  # leave room for the skills line(s)
                 capacity = max(1, list_end - list_start)
 
                 tool_scroll = max(0, min(tool_scroll, max(0, len(all_tools) - capacity)))
@@ -635,10 +662,13 @@ def draw(stdscr):
                     line = f"  {name[:24]:24} {count:>5}  " + "#" * bar_len
                     safe_addstr(stdscr, drow, 0, line[: w_ - 1])
                     drow += 1
-                drow = max(drow, h - 1 - skills_line_reserved)
+                drow = max(drow, list_end)
             drow += 1
-            if drow < h:
-                safe_addstr(stdscr, drow, 0, f"Skills used: {sel.all_skills()}"[: w_ - 1])
+            for line in skills_lines:
+                if drow >= h:
+                    break
+                safe_addstr(stdscr, drow, 0, line[: w_ - 1])
+                drow += 1
 
         stdscr.refresh()
 
