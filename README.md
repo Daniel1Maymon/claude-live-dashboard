@@ -1,5 +1,7 @@
 # claude-live-dashboard
 
+![screenshot](docs/screenshot.png)
+
 A live terminal dashboard for monitoring all your locally-running [Claude Code](https://claude.com/claude-code) CLI sessions at once — built to make it easy to spot a session that's burning context, looping on the same tool call, or stalled while busy.
 
 ![status](https://img.shields.io/badge/status-personal_tool-blue)
