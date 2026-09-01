@@ -146,29 +146,43 @@ def _fetch_usage():
 
 class UsageState:
     """Thread-safe holder for the latest usage snapshot, refreshed by a daemon thread —
-    the API call must never block the curses render/input loop."""
+    the API call must never block the curses render/input loop.
+
+    The endpoint is undocumented and rate-limits hard (429) once more than one consumer
+    shares the same account token — e.g. this dashboard running in more than one terminal,
+    plus the Dev Dispatch server's own /api/usage poller, plus Claude Code's own /usage.
+    A single failed poll is routine, not an outage: we keep showing the last GOOD reading
+    (marked stale once it's old enough) instead of blanking to "unavailable" on every miss.
+    """
 
     def __init__(self):
         self.data = None
-        self.ok = False
-        self.updated_at = 0.0
+        self.last_success_at = 0.0
+        self.last_attempt_at = 0.0
+        self.consecutive_failures = 0
         self._lock = threading.Lock()
 
     def snapshot(self):
         with self._lock:
-            return self.data, self.ok, self.updated_at
+            return self.data, self.last_success_at, self.last_attempt_at, self.consecutive_failures
 
     def _worker(self):
         while True:
             d = _fetch_usage()
             with self._lock:
+                self.last_attempt_at = time.time()
                 if d is not None:
                     self.data = d
-                    self.ok = True
+                    self.last_success_at = self.last_attempt_at
+                    self.consecutive_failures = 0
                 else:
-                    self.ok = False
-                self.updated_at = time.time()
-            time.sleep(USAGE_REFRESH_SECS)
+                    # Keep the stale self.data as-is — a 429/network blip shouldn't erase
+                    # a perfectly good reading from a minute ago.
+                    self.consecutive_failures += 1
+            # Back off on repeated failures (e.g. a sustained 429) so we don't keep hammering
+            # an endpoint that's already telling us to slow down — capped at 10x the base interval.
+            backoff = min(self.consecutive_failures, 10)
+            time.sleep(USAGE_REFRESH_SECS * (1 + backoff))
 
     def start(self):
         threading.Thread(target=self._worker, daemon=True).start()
@@ -185,11 +199,17 @@ def _resets_str(iso_str):
     return "now" if secs <= 0 else duration_str(secs)
 
 
+USAGE_STALE_SECS = USAGE_REFRESH_SECS * 3  # keep showing a good reading this long past its
+                                            # last successful fetch before calling it stale
+
+
 def usage_line_parts(usage_state):
     """Returns (text, worst_pct) — worst_pct is the higher of session/weekly utilization,
     used by the caller to pick a warning color, or None if there's nothing to show yet."""
-    data, ok, updated_at = usage_state.snapshot()
-    if not ok or not data:
+    data, last_success_at, last_attempt_at, failures = usage_state.snapshot()
+    if not data:
+        if last_attempt_at == 0:
+            return "Usage: loading…", None
         return "Usage: unavailable (no token, offline, or rate-limited)", None
     fh = data.get("five_hour") or {}
     sd = data.get("seven_day") or {}
@@ -197,9 +217,11 @@ def usage_line_parts(usage_state):
     sd_pct = sd.get("utilization")
     fh_str = f"{fh_pct:.0f}%" if fh_pct is not None else "?"
     sd_str = f"{sd_pct:.0f}%" if sd_pct is not None else "?"
+    age = time.time() - last_success_at
+    stale_note = f"  (stale, last updated {duration_str(age)} ago — likely rate-limited)" if age >= USAGE_STALE_SECS else ""
     text = (
         f"Usage — Session: {fh_str} (resets {_resets_str(fh.get('resets_at'))})   "
-        f"Weekly: {sd_str} (resets {_resets_str(sd.get('resets_at'))})"
+        f"Weekly: {sd_str} (resets {_resets_str(sd.get('resets_at'))}){stale_note}"
     )
     pcts = [p for p in (fh_pct, sd_pct) if p is not None]
     return text, (max(pcts) if pcts else None)
@@ -563,8 +585,11 @@ def draw(stdscr):
         ("Top banner", curses.A_BOLD),
         ("  Usage — Session / Weekly   Your account's live plan usage (5-hour session window and", 0),
         ("  7-day weekly window), from the same endpoint Claude Code's own /usage reads. Refreshes", 0),
-        ("  every 60s. Dim = normal, yellow >= 60%, red >= 85%. Shows 'unavailable' if the OAuth", 0),
-        ("  token can't be read from Keychain or the request fails/rate-limits.", 0),
+        ("  every 60s. Dim = normal, yellow >= 60%, red >= 85%. The endpoint rate-limits hard once", 0),
+        ("  more than one thing polls it (this dashboard open twice, Dev Dispatch, /usage itself),", 0),
+        ("  so a failed poll keeps showing the last good reading, marked '(stale)' after ~3 misses,", 0),
+        ("  instead of blanking out. Shows 'unavailable' only if there's never been a good reading", 0),
+        ("  (no Keychain token, offline).", 0),
         ("", 0),
         ("Columns", curses.A_BOLD),
         ("  CTX        Context size of the LAST turn (cache_read + cache_creation + input).", 0),
