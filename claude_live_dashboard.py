@@ -22,7 +22,10 @@ import re
 import shutil
 import subprocess
 import textwrap
+import threading
 import time
+import urllib.error
+import urllib.request
 from collections import OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
@@ -50,6 +53,11 @@ LOWCACHE_RATIO = 0.4
 LOOP_RUN_LEN = 4
 STALL_BUSY_SECS = 300
 DESKTOP_ACTIVE_SECS = 20  # claude-desktop has no real status; transcript-recency heuristic only
+
+USAGE_REFRESH_SECS = 60  # same undocumented endpoint Claude Code's own /usage uses — rate-limits
+                          # aggressively (429) if polled tighter than this
+USAGE_WARN_RATIO = 60
+USAGE_CRIT_RATIO = 85
 
 CMUX_BIN = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 if not Path(CMUX_BIN).exists():
@@ -95,6 +103,106 @@ def ago_str(ts_ms: float) -> str:
 
 def abs_str(ts_ms: float) -> str:
     return datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M")
+
+
+def _get_oauth_token():
+    """Read the Claude Code OAuth token from the macOS Keychain — the same one the CLI itself
+    uses to call the usage endpoint. Returns None on anything short of full success; this is
+    best-effort telemetry, never worth surfacing an error for."""
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout).get("claudeAiOauth", {}).get("accessToken")
+    except ValueError:
+        return None
+
+
+def _fetch_usage():
+    """Hit the same undocumented endpoint Claude Code's own /usage and status line use.
+    Returns the parsed JSON dict, or None on any failure (no token, network error, 429, ...)."""
+    token = _get_oauth_token()
+    if not token:
+        return None
+    req = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/usage",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read())
+    except (urllib.error.URLError, ValueError, OSError, TimeoutError):
+        return None
+
+
+class UsageState:
+    """Thread-safe holder for the latest usage snapshot, refreshed by a daemon thread —
+    the API call must never block the curses render/input loop."""
+
+    def __init__(self):
+        self.data = None
+        self.ok = False
+        self.updated_at = 0.0
+        self._lock = threading.Lock()
+
+    def snapshot(self):
+        with self._lock:
+            return self.data, self.ok, self.updated_at
+
+    def _worker(self):
+        while True:
+            d = _fetch_usage()
+            with self._lock:
+                if d is not None:
+                    self.data = d
+                    self.ok = True
+                else:
+                    self.ok = False
+                self.updated_at = time.time()
+            time.sleep(USAGE_REFRESH_SECS)
+
+    def start(self):
+        threading.Thread(target=self._worker, daemon=True).start()
+
+
+def _resets_str(iso_str):
+    if not iso_str:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        secs = (dt - datetime.now(dt.tzinfo)).total_seconds()
+    except ValueError:
+        return "?"
+    return "now" if secs <= 0 else duration_str(secs)
+
+
+def usage_line_parts(usage_state):
+    """Returns (text, worst_pct) — worst_pct is the higher of session/weekly utilization,
+    used by the caller to pick a warning color, or None if there's nothing to show yet."""
+    data, ok, updated_at = usage_state.snapshot()
+    if not ok or not data:
+        return "Usage: unavailable (no token, offline, or rate-limited)", None
+    fh = data.get("five_hour") or {}
+    sd = data.get("seven_day") or {}
+    fh_pct = fh.get("utilization")
+    sd_pct = sd.get("utilization")
+    fh_str = f"{fh_pct:.0f}%" if fh_pct is not None else "?"
+    sd_str = f"{sd_pct:.0f}%" if sd_pct is not None else "?"
+    text = (
+        f"Usage — Session: {fh_str} (resets {_resets_str(fh.get('resets_at'))})   "
+        f"Weekly: {sd_str} (resets {_resets_str(sd.get('resets_at'))})"
+    )
+    pcts = [p for p in (fh_pct, sd_pct) if p is not None]
+    return text, (max(pcts) if pcts else None)
 
 
 class SessionState:
@@ -422,6 +530,9 @@ def draw(stdscr):
     curses.init_pair(5, curses.COLOR_GREEN, -1)
     GREEN = curses.color_pair(5)
 
+    usage_state = UsageState()
+    usage_state.start()
+
     states = {}
     selected_sid = None
     tool_scroll = 0
@@ -448,6 +559,12 @@ def draw(stdscr):
         ("                  guess from transcript recency, not authoritative like the others.", 0),
         ("  desktop~active  Same, but the transcript was written within the last 20s.", 0),
         ("  -               No status available for this session.", 0),
+        ("", 0),
+        ("Top banner", curses.A_BOLD),
+        ("  Usage — Session / Weekly   Your account's live plan usage (5-hour session window and", 0),
+        ("  7-day weekly window), from the same endpoint Claude Code's own /usage reads. Refreshes", 0),
+        ("  every 60s. Dim = normal, yellow >= 60%, red >= 85%. Shows 'unavailable' if the OAuth", 0),
+        ("  token can't be read from Keychain or the request fails/rate-limits.", 0),
         ("", 0),
         ("Columns", curses.A_BOLD),
         ("  CTX        Context size of the LAST turn (cache_read + cache_creation + input).", 0),
@@ -555,7 +672,7 @@ def draw(stdscr):
 
         # Give the table only the rows it needs; the detail panel gets whatever's left,
         # so the tool list has as much room as possible (still scrollable if it overflows).
-        table_needed = len(rows) + 4
+        table_needed = len(rows) + 5
         detail_min = 10
         table_h = table_needed if h - table_needed >= detail_min else max(5, h - detail_min)
 
@@ -564,22 +681,31 @@ def draw(stdscr):
             f"Claude Code — {len(states)} running, sorted by last message  [↑/↓ select, Enter/g cmux, c clear, k compact, ? help, q quit]"[: w_ - 1],
         )
 
+        usage_text, usage_worst = usage_line_parts(usage_state)
+        if usage_worst is not None and usage_worst >= USAGE_CRIT_RATIO:
+            usage_attr = curses.A_BOLD | RED
+        elif usage_worst is not None and usage_worst >= USAGE_WARN_RATIO:
+            usage_attr = YELLOW
+        else:
+            usage_attr = DIM
+        safe_addstr(stdscr, 1, 0, usage_text[: w_ - 1], usage_attr)
+
         if pending_confirm:
             sel = states.get(pending_confirm["sid"])
             sel_name = sel.name if sel else "?"
             action_word = "/clear" if pending_confirm["action"] == "clear" else "/compact"
             queued_note = " (session is busy — it'll queue and run once its current turn finishes)" if sel and sel.status == "busy" else ""
             safe_addstr(
-                stdscr, 1, 0,
+                stdscr, 2, 0,
                 f"Send {action_word} to {sel_name}?{queued_note} This changes its live conversation. [y/N]"[: w_ - 1],
                 curses.A_BOLD | YELLOW,
             )
         elif status_msg and time.time() < status_expiry:
-            safe_addstr(stdscr, 1, 0, status_msg[: w_ - 1], GREEN if status_ok else RED)
+            safe_addstr(stdscr, 2, 0, status_msg[: w_ - 1], GREEN if status_ok else RED)
         else:
-            safe_addstr(stdscr, 1, 0, "-" * (w_ - 1))
+            safe_addstr(stdscr, 2, 0, "-" * (w_ - 1))
 
-        row = 2
+        row = 3
         x = 0
         for hname, cw in zip(col_headers, widths):
             safe_addstr(stdscr, row, x, hname[:cw].ljust(cw), curses.A_BOLD)
