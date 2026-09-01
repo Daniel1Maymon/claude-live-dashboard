@@ -49,6 +49,7 @@ LOWCACHE_MIN_CTX = 20_000
 LOWCACHE_RATIO = 0.4
 LOOP_RUN_LEN = 4
 STALL_BUSY_SECS = 300
+DESKTOP_ACTIVE_SECS = 20  # claude-desktop has no real status; transcript-recency heuristic only
 
 CMUX_BIN = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 if not Path(CMUX_BIN).exists():
@@ -439,6 +440,11 @@ def draw(stdscr):
         ("  busy       Actively generating (model streaming a response).", 0),
         ("  shell      Currently running a shell/Bash command.", 0),
         ("  waiting    Blocked on a permission/approval dialog — needs your input.", 0),
+        ("  desktop         Claude Desktop session, idle-ish — that client has no real status", 0),
+        ("                  field (different IPC protocol than the CLI), so this is a best-effort", 0),
+        ("                  guess from transcript recency, not authoritative like the others.", 0),
+        ("  desktop~active  Same, but the transcript was written within the last 20s.", 0),
+        ("  -               No status available for this session.", 0),
         ("", 0),
         ("Columns", curses.A_BOLD),
         ("  CTX        Context size of the LAST turn (cache_read + cache_creation + input).", 0),
@@ -487,12 +493,31 @@ def draw(stdscr):
                     states[sid] = SessionState(sid)
                 st = states[sid]
                 st.name = w.get("name", pid_str)
-                st.status = w.get("status", "-")
                 st.cwd = w.get("cwd", "?")
                 st.pid = pid
+                is_desktop = w.get("entrypoint") == "claude-desktop"
+                if w.get("status"):
+                    st.status = w["status"]
+                elif not is_desktop:
+                    st.status = "-"
+                # else: leave st.status as whatever the desktop heuristic below sets, after
+                # st.update() has refreshed last_msg_ts_ms from the transcript.
                 if w.get("startedAt"):
                     st.created_ms = w["startedAt"]
                 st.update()
+                if is_desktop and not w.get("status"):
+                    # The claude-desktop client never writes a "status" field at all — it runs a
+                    # stream-json IPC protocol to the Desktop app, not the CLI's interactive
+                    # terminal loop that produces that field (confirmed: checked every file in
+                    # its app-data directory, found no per-session status file anywhere; checked
+                    # the live process's own command line, confirmed the different protocol).
+                    # Best available real proxy: how recently the transcript was actually written
+                    # — the same signal LAST MSG already uses — labeled as approximate since it
+                    # can't distinguish busy/waiting the way the CLI's authoritative field does.
+                    if st.last_msg_ts_ms and (time.time() - st.last_msg_ts_ms / 1000) < DESKTOP_ACTIVE_SECS:
+                        st.status = "desktop~active"
+                    else:
+                        st.status = "desktop"
 
             for sid in list(states.keys()):
                 if sid not in live_ids:
