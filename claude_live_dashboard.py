@@ -54,8 +54,9 @@ LOOP_RUN_LEN = 4
 STALL_BUSY_SECS = 300
 DESKTOP_ACTIVE_SECS = 20  # claude-desktop has no real status; transcript-recency heuristic only
 
-USAGE_REFRESH_SECS = 60  # same undocumented endpoint Claude Code's own /usage uses — rate-limits
-                          # aggressively (429) if polled tighter than this
+USAGE_REFRESH_SECS = 180  # same undocumented endpoint Claude Code's own /usage uses — shared,
+                           # account-wide rate limit that many Claude Code sessions' status lines
+                           # also poll independently, so keep this dashboard's own footprint light
 USAGE_WARN_RATIO = 60
 USAGE_CRIT_RATIO = 85
 
