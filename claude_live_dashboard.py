@@ -18,9 +18,11 @@ import curses
 import json
 import locale
 import os
+import random
 import re
 import shutil
 import signal
+import string
 import subprocess
 import textwrap
 import threading
@@ -140,7 +142,8 @@ def _fetch_usage():
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        # URL is a hardcoded literal above, never derived from input — no scheme-confusion risk.
+        with urllib.request.urlopen(req, timeout=8) as resp:  # nosec B310
             return json.loads(resp.read())
     except (urllib.error.URLError, ValueError, OSError, TimeoutError):
         return None
@@ -549,6 +552,17 @@ def close_session(session_id: str, pid: int, entrypoint):
 NEW_SESSION_MODELS = ["sonnet", "opus", "fable"]  # CLI aliases for --model, always the latest of each
 
 
+def random_session_name(existing_names) -> str:
+    """6 lowercase-alnum chars, retried against `existing_names` until it doesn't collide —
+    used when the user leaves the new-session name field blank rather than launching an
+    unnamed/indistinguishable session."""
+    alphabet = string.ascii_lowercase + string.digits
+    while True:
+        candidate = "".join(random.choices(alphabet, k=6))
+        if candidate not in existing_names:
+            return candidate
+
+
 def launch_new_session(name: str, model: str):
     """Open a new cmux tab running `claude --model <model> --permission-mode auto` and rename it.
     --permission-mode auto means the new session runs without stopping for permission prompts —
@@ -702,9 +716,10 @@ def draw(stdscr):
         ("  x             close (terminate) this session (asks y/N). Closes its cmux tab if it has", 0),
         ("                one, otherwise sends SIGTERM directly. Refused for Claude Desktop sessions", 0),
         ("                — close those from the Desktop app itself.", 0),
-        ("  n             new session: type a name (Enter), pick a model with up/down (Enter to", 0),
-        ("                launch, Esc cancels either step). Opens a new cmux tab running", 0),
-        ("                `claude --model <model> --permission-mode auto`, then sends /rename once", 0),
+        ("  n             new session: type a name (Enter — leave blank for a random 6-char name,", 0),
+        ("                guaranteed not to collide with any running session), pick a model with", 0),
+        ("                up/down (Enter to launch, Esc cancels either step). Opens a new cmux tab", 0),
+        ("                running `claude --model <model> --permission-mode auto`, then sends /rename once", 0),
         ("                it's up. --permission-mode auto means the new session won't stop to ask", 0),
         ("                before running tools — same as launching it that way yourself.", 0),
         ("  r             rename the selected session: type a new name (prefilled with the current", 0),
@@ -806,16 +821,13 @@ def draw(stdscr):
             time.sleep(0.05)
             continue
 
-        # Give the table only the rows it needs; the detail panel gets whatever's left,
-        # so the tool list has as much room as possible (still scrollable if it overflows).
-        table_needed = len(rows) + 5
-        detail_min = 10
-        table_h = table_needed if h - table_needed >= detail_min else max(5, h - detail_min)
+        # Free-text lines (title, usage banner, status/prompt) WRAP onto extra rows instead of
+        # truncating — a narrow terminal (or a big font) used to just chop them off invisibly.
+        # Only prose wraps like this; the table itself still truncates per-column, same as always.
+        def wrap_lines(text):
+            return textwrap.wrap(text, max(1, w_ - 1)) or [""]
 
-        safe_addstr(
-            stdscr, 0, 0,
-            f"Claude Code — {len(states)} running, sorted by last message  [↑/↓ select, Enter/g cmux, c clear, k compact, x close, n new, r rename, ? help, q quit]"[: w_ - 1],
-        )
+        title_text = f"Claude Code — {len(states)} running, sorted by last message  [↑/↓ select, Enter/g cmux, c clear, k compact, x close, n new, r rename, ? help, q quit]"
 
         usage_text, usage_worst = usage_line_parts(usage_state)
         if usage_worst is not None and usage_worst >= USAGE_CRIT_RATIO:
@@ -824,44 +836,61 @@ def draw(stdscr):
             usage_attr = YELLOW
         else:
             usage_attr = DIM
-        safe_addstr(stdscr, 1, 0, usage_text[: w_ - 1], usage_attr)
 
         if rename_state is not None:
             sel = states.get(rename_state["sid"])
             old_name = sel.name if sel else "?"
-            prompt = f"Rename {old_name} to: {rename_state['name']}_  (Enter to send /rename, Esc to cancel)"
-            safe_addstr(stdscr, 2, 0, prompt[: w_ - 1], curses.A_BOLD | GREEN)
+            prompt_text = f"Rename {old_name} to: {rename_state['name']}_  (Enter to send /rename, Esc to cancel)"
+            prompt_attr = curses.A_BOLD | GREEN
         elif new_session is not None:
             if new_session["stage"] == "name":
-                prompt = f"New session — name: {new_session['name']}_  (Enter to continue, Esc to cancel)"
+                prompt_text = f"New session — name: {new_session['name']}_  (Enter to continue — leave blank for a random name, Esc to cancel)"
             else:
                 model = NEW_SESSION_MODELS[new_session["model_idx"]]
-                prompt = f"New session '{new_session['name']}' — model: [{model}]  (up/down to change, Enter to launch, Esc to cancel)"
-            safe_addstr(stdscr, 2, 0, prompt[: w_ - 1], curses.A_BOLD | GREEN)
+                prompt_text = f"New session '{new_session['name']}' — model: [{model}]  (up/down to change, Enter to launch, Esc to cancel)"
+            prompt_attr = curses.A_BOLD | GREEN
         elif pending_confirm and pending_confirm["action"] == "close":
             sel = states.get(pending_confirm["sid"])
             sel_name = sel.name if sel else "?"
-            safe_addstr(
-                stdscr, 2, 0,
-                f"Close (terminate) {sel_name}? This ends its process — unsaved conversation state is lost. [y/N]"[: w_ - 1],
-                curses.A_BOLD | RED,
-            )
+            prompt_text = f"Close (terminate) {sel_name}? This ends its process — unsaved conversation state is lost. [y/N]"
+            prompt_attr = curses.A_BOLD | RED
         elif pending_confirm:
             sel = states.get(pending_confirm["sid"])
             sel_name = sel.name if sel else "?"
             action_word = "/clear" if pending_confirm["action"] == "clear" else "/compact"
             queued_note = " (session is busy — it'll queue and run once its current turn finishes)" if sel and sel.status == "busy" else ""
-            safe_addstr(
-                stdscr, 2, 0,
-                f"Send {action_word} to {sel_name}?{queued_note} This changes its live conversation. [y/N]"[: w_ - 1],
-                curses.A_BOLD | YELLOW,
-            )
+            prompt_text = f"Send {action_word} to {sel_name}?{queued_note} This changes its live conversation. [y/N]"
+            prompt_attr = curses.A_BOLD | YELLOW
         elif status_msg and time.time() < status_expiry:
-            safe_addstr(stdscr, 2, 0, status_msg[: w_ - 1], GREEN if status_ok else RED)
+            prompt_text = status_msg
+            prompt_attr = GREEN if status_ok else RED
         else:
-            safe_addstr(stdscr, 2, 0, "-" * (w_ - 1))
+            prompt_text = None
+            prompt_attr = curses.A_NORMAL
 
-        row = 3
+        title_lines = wrap_lines(title_text)
+        usage_lines = wrap_lines(usage_text)
+        prompt_lines = wrap_lines(prompt_text) if prompt_text is not None else ["-" * (w_ - 1)]
+
+        # Give the table only the rows it needs; the detail panel gets whatever's left,
+        # so the tool list has as much room as possible (still scrollable if it overflows).
+        # +2 below is the column-header row and its dashed separator (never wrapped).
+        header_block_lines = len(title_lines) + len(usage_lines) + len(prompt_lines)
+        table_needed = len(rows) + header_block_lines + 2
+        detail_min = 10
+        table_h = table_needed if h - table_needed >= detail_min else max(5, h - detail_min)
+
+        row = 0
+        for line in title_lines:
+            safe_addstr(stdscr, row, 0, line)
+            row += 1
+        for line in usage_lines:
+            safe_addstr(stdscr, row, 0, line, usage_attr)
+            row += 1
+        for line in prompt_lines:
+            safe_addstr(stdscr, row, 0, line, prompt_attr)
+            row += 1
+
         x = 0
         for hname, cw in zip(col_headers, widths):
             safe_addstr(stdscr, row, x, hname[:cw].ljust(cw), curses.A_BOLD)
@@ -1017,10 +1046,13 @@ def draw(stdscr):
                 set_status("Cancelled.", True)
             elif new_session["stage"] == "name":
                 if c in (10, 13, curses.KEY_ENTER):
-                    if new_session["name"].strip():
-                        new_session["stage"] = "model"
-                        new_session["model_idx"] = 0
-                    # else: empty name — stay on this field, Enter does nothing
+                    typed = new_session["name"].strip()
+                    if not typed:
+                        existing = {st.name for st in states.values()}
+                        typed = random_session_name(existing)
+                    new_session["name"] = typed
+                    new_session["stage"] = "model"
+                    new_session["model_idx"] = 0
                 elif c in (127, curses.KEY_BACKSPACE, 8):
                     new_session["name"] = new_session["name"][:-1]
                 elif 32 <= c <= 126 and len(new_session["name"]) < 40:
