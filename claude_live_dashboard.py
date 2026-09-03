@@ -446,6 +446,17 @@ def fmt_k(n: int) -> str:
     return str(n)
 
 
+def compacting_bar(width: int = 6) -> str:
+    """An animated back-and-forth bar for a session that's mid-/compact. There's no real
+    progress percentage available anywhere (Claude Code doesn't expose one), so this is
+    deliberately just an activity indicator, not a measured 0-100% fill."""
+    period = max(1, width * 2 - 2)
+    pos = int(time.time() * 6) % period
+    if pos >= width:
+        pos = period - pos
+    return "[" + "".join("#" if i == pos else "-" for i in range(width - 2)) + "]"
+
+
 def safe_addstr(stdscr, y, x, text, attr=curses.A_NORMAL):
     try:
         stdscr.addstr(y, x, text, attr)
@@ -667,8 +678,8 @@ def draw(stdscr):
     prev_show_help = False
     stdscr.timeout(100)  # getch blocks up to 100ms — keeps nav responsive between data refreshes
 
-    col_headers = ["NAME", "STATUS", "MODEL", "CTX", "%LIM", "LAST OUT", "!", "LAST MSG", "CREATED"]
-    widths = [20, 8, 10, 8, 7, 9, 3, 9, 9]
+    col_headers = ["NAME", "STATUS", "BAR", "MODEL", "CTX", "%LIM", "LAST OUT", "!", "LAST MSG", "CREATED"]
+    widths = [20, 8, 8, 10, 8, 7, 9, 3, 9, 9]
 
     HELP_LINES = [
         ("STATUS values", curses.A_BOLD),
@@ -924,6 +935,7 @@ def draw(stdscr):
             vals = [
                 display_name,
                 st.status,
+                compacting_bar() if st.compact_pending else "",
                 (st.model or "?").replace("claude-", ""),
                 f"{fmt_k(st.context_tokens)}?" if st.compact_pending else fmt_k(st.context_tokens),
                 "?" if st.compact_pending else (
