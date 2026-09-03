@@ -20,13 +20,14 @@ import locale
 import os
 import re
 import shutil
+import signal
 import subprocess
 import textwrap
 import threading
 import time
 import urllib.error
 import urllib.request
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
 
@@ -235,6 +236,7 @@ class SessionState:
         self.status = "-"
         self.cwd = "?"
         self.pid = None
+        self.entrypoint = None
         self.path = None
         self.offset = 0
         self.model = None
@@ -325,7 +327,10 @@ class SessionState:
                     # the current numbers as stale/pending instead of guessing or leaving them look
                     # accurate.
                     self.compact_pending = True
-                if msg.get("model"):
+                # "<synthetic>" is a real value Claude Code itself writes for a placeholder
+                # assistant turn that never actually called a model (e.g. "No response requested.",
+                # zeroed usage) — skip it so MODEL keeps showing the last turn that really ran.
+                if msg.get("model") and msg["model"] != "<synthetic>":
                     self.model = msg["model"]
                 u = msg.get("usage")
                 if u:
@@ -515,6 +520,32 @@ def cmux_navigate(session_id: str):
     return True, f"Switched to {loc['workspace_ref']} / {loc['surface_ref']} in cmux"
 
 
+def close_session(session_id: str, pid: int, entrypoint):
+    """Terminate a session. Claude Desktop sessions are refused: unlike a CLI process (one pid
+    per session, confirmed 1:1 by every session file checked), we've never verified a Desktop
+    pid isn't shared across multiple conversations in the same app instance — killing it could
+    take down more than the one you asked to close. For everything else, close its cmux pane
+    if it has one (the clean path — closing the tab is what a user would do by hand), falling
+    back to a direct SIGTERM for headless sessions (e.g. sdk-cli) with no pane to close."""
+    if entrypoint == "claude-desktop":
+        return False, "Can't close a Claude Desktop session from here — close it in the Desktop app itself"
+    loc = cmux_find_surface(session_id)
+    if loc:
+        ok, msg = cmux_run("close-surface", "--surface", loc["surface_ref"], "--workspace", loc["workspace_ref"])
+        if ok:
+            return True, f"Closed {loc['workspace_ref']} / {loc['surface_ref']} in cmux"
+        return False, f"close-surface failed: {msg}"
+    if not pid:
+        return False, "No pid on record for this session"
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True, f"pid {pid} was already gone"
+    except OSError as e:
+        return False, f"kill failed: {e}"
+    return True, f"Sent SIGTERM to pid {pid} (not in a cmux pane)"
+
+
 def cmux_send_command(session_id: str, text: str):
     loc = cmux_find_surface(session_id)
     if not loc:
@@ -556,6 +587,14 @@ def draw(stdscr):
     usage_state = UsageState()
     usage_state.start()
 
+    # Python's curses caches the terminal size from initscr() and does NOT refresh it on a
+    # resize (which a font-size change causes too — same character-grid change as dragging the
+    # window edge) unless something explicitly calls update_lines_cols() in response to SIGWINCH.
+    # Without this, stdscr.getmaxyx() below silently keeps returning the OLD size forever,
+    # cutting off the redraw exactly like the too-narrow layout reported in testing.
+    resized = threading.Event()
+    signal.signal(signal.SIGWINCH, lambda signum, frame: resized.set())
+
     states = {}
     selected_sid = None
     tool_scroll = 0
@@ -568,8 +607,8 @@ def draw(stdscr):
     prev_show_help = False
     stdscr.timeout(100)  # getch blocks up to 100ms — keeps nav responsive between data refreshes
 
-    col_headers = ["NAME", "STATUS", "CTX", "%LIM", "LAST OUT", "!", "LAST MSG", "CREATED"]
-    widths = [16, 8, 8, 7, 9, 3, 9, 9]
+    col_headers = ["NAME", "STATUS", "MODEL", "CTX", "%LIM", "LAST OUT", "!", "LAST MSG", "CREATED"]
+    widths = [20, 8, 10, 8, 7, 9, 3, 9, 9]
 
     HELP_LINES = [
         ("STATUS values", curses.A_BOLD),
@@ -593,6 +632,10 @@ def draw(stdscr):
         ("  (no Keychain token, offline).", 0),
         ("", 0),
         ("Columns", curses.A_BOLD),
+        ("  NAME       If two sessions share the same name (e.g. both /rename'd \"#1\"), the PID is", 0),
+        ("             appended (name·pid) so they're never indistinguishable in this table.", 0),
+        ("  MODEL      Model of the LAST turn (from the transcript's assistant messages). '?' until", 0),
+        ("             the session has had a real turn.", 0),
         ("  CTX        Context size of the LAST turn (cache_read + cache_creation + input).", 0),
         ("  %LIM       CTX as a % of this session's model's context window (1M for Sonnet/Opus/", 0),
         ("             Fable 5, 200K default otherwise). THIS is the number to watch for compacting —", 0),
@@ -610,6 +653,9 @@ def draw(stdscr):
         ("  Enter / g     jump to that session's tab in cmux", 0),
         ("  c             send /clear (asks y/N; queues if the session is busy)", 0),
         ("  k             send /compact (asks y/N; queues if the session is busy)", 0),
+        ("  x             close (terminate) this session (asks y/N). Closes its cmux tab if it has", 0),
+        ("                one, otherwise sends SIGTERM directly. Refused for Claude Desktop sessions", 0),
+        ("                — close those from the Desktop app itself.", 0),
         ("  PgUp/PgDn     scroll the tool list in the detail panel", 0),
         ("  ?             toggle this help", 0),
         ("  q             quit", 0),
@@ -642,7 +688,8 @@ def draw(stdscr):
                 st.name = w.get("name", pid_str)
                 st.cwd = w.get("cwd", "?")
                 st.pid = pid
-                is_desktop = w.get("entrypoint") == "claude-desktop"
+                st.entrypoint = w.get("entrypoint")
+                is_desktop = st.entrypoint == "claude-desktop"
                 if w.get("status"):
                     st.status = w["status"]
                 elif not is_desktop:
@@ -675,7 +722,13 @@ def draw(stdscr):
         if selected_sid not in states and rows:
             selected_sid = rows[0][0]
 
-        if show_help != prev_show_help:
+        if resized.is_set():
+            resized.clear()
+            curses.update_lines_cols()  # pulls the real current size from the terminal (ioctl),
+                                         # which getmaxyx() alone won't do on its own after SIGWINCH
+            stdscr.resize(curses.LINES, curses.COLS)
+            stdscr.clear()
+        elif show_help != prev_show_help:
             stdscr.clear()  # full repaint on transition — erase() alone can leave stale cells behind
         else:
             stdscr.erase()
@@ -704,7 +757,7 @@ def draw(stdscr):
 
         safe_addstr(
             stdscr, 0, 0,
-            f"Claude Code — {len(states)} running, sorted by last message  [↑/↓ select, Enter/g cmux, c clear, k compact, ? help, q quit]"[: w_ - 1],
+            f"Claude Code — {len(states)} running, sorted by last message  [↑/↓ select, Enter/g cmux, c clear, k compact, x close, ? help, q quit]"[: w_ - 1],
         )
 
         usage_text, usage_worst = usage_line_parts(usage_state)
@@ -716,7 +769,15 @@ def draw(stdscr):
             usage_attr = DIM
         safe_addstr(stdscr, 1, 0, usage_text[: w_ - 1], usage_attr)
 
-        if pending_confirm:
+        if pending_confirm and pending_confirm["action"] == "close":
+            sel = states.get(pending_confirm["sid"])
+            sel_name = sel.name if sel else "?"
+            safe_addstr(
+                stdscr, 2, 0,
+                f"Close (terminate) {sel_name}? This ends its process — unsaved conversation state is lost. [y/N]"[: w_ - 1],
+                curses.A_BOLD | RED,
+            )
+        elif pending_confirm:
             sel = states.get(pending_confirm["sid"])
             sel_name = sel.name if sel else "?"
             action_word = "/clear" if pending_confirm["action"] == "clear" else "/compact"
@@ -740,6 +801,11 @@ def draw(stdscr):
         safe_addstr(stdscr, row, 0, "-" * (w_ - 1))
         row += 1
 
+        # Two sessions can carry the SAME name (e.g. both manually /rename'd to "#1", or two
+        # sessions with the same auto-derived default) — disambiguate by appending the PID,
+        # the one thing guaranteed unique between them, rather than showing an indistinguishable pair.
+        name_counts = Counter(st.name for _, st in rows)
+
         for sid, st in rows:
             if row >= table_h - 1:
                 break
@@ -756,9 +822,11 @@ def draw(stdscr):
             else:
                 attr = curses.A_NORMAL
 
+            display_name = f"{st.name}·{st.pid}" if name_counts[st.name] > 1 else st.name
             vals = [
-                st.name,
+                display_name,
                 st.status,
+                (st.model or "?").replace("claude-", ""),
                 f"{fmt_k(st.context_tokens)}?" if st.compact_pending else fmt_k(st.context_tokens),
                 "?" if st.compact_pending else (
                     f"{st.ctx_pct:.0f}%" if st.ctx_pct is not None else "-"
@@ -859,10 +927,20 @@ def draw(stdscr):
         if pending_confirm is not None:
             if c in (ord("y"), ord("Y")):
                 sid = pending_confirm["sid"]
-                cmd = "/clear" if pending_confirm["action"] == "clear" else "/compact"
-                if sid in states:
-                    ok, msg = cmux_send_command(sid, cmd)
-                    set_status(f"{cmd} -> {states[sid].name}: {msg}" if ok else f"Failed: {msg}", ok)
+                if pending_confirm["action"] == "close":
+                    if sid in states:
+                        st = states[sid]
+                        ok, msg = close_session(sid, st.pid, st.entrypoint)
+                        set_status(f"Close {st.name}: {msg}" if ok else f"Failed: {msg}", ok)
+                        if ok:
+                            del states[sid]
+                            if selected_sid == sid:
+                                selected_sid = None
+                else:
+                    cmd = "/clear" if pending_confirm["action"] == "clear" else "/compact"
+                    if sid in states:
+                        ok, msg = cmux_send_command(sid, cmd)
+                        set_status(f"{cmd} -> {states[sid].name}: {msg}" if ok else f"Failed: {msg}", ok)
                 pending_confirm = None
             elif c != -1:
                 set_status("Cancelled.", True)
@@ -890,6 +968,8 @@ def draw(stdscr):
             pending_confirm = {"action": "clear", "sid": selected_sid}
         elif c in (ord("k"), ord("K")) and selected_sid in states:
             pending_confirm = {"action": "compact", "sid": selected_sid}
+        elif c in (ord("x"), ord("X")) and selected_sid in states:
+            pending_confirm = {"action": "close", "sid": selected_sid}
 
 
 if __name__ == "__main__":
