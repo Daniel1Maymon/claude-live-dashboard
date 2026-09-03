@@ -1110,8 +1110,9 @@ def draw(stdscr):
                             # whatever real turn happens next — which could be a long time.
                             # A trivial follow-up forces that turn right away; cmux queues it
                             # while the session is still busy compacting, so it lands the
-                            # moment compaction finishes.
-                            cmux_send_command(sid, "ok")
+                            # moment compaction finishes. Asking for a single character keeps
+                            # the forced turn's own output as cheap as possible.
+                            cmux_send_command(sid, "write a dot (.)")
                         set_status(f"{cmd} -> {states[sid].name}: {msg}" if ok else f"Failed: {msg}", ok)
                 pending_confirm = None
             elif c != -1:
