@@ -86,6 +86,17 @@ def _msg_text(msg: dict) -> str:
     return ""
 
 
+def _is_slash_command(text: str, name: str) -> bool:
+    """True if `text` (a full, stripped user-message content) IS the given slash command
+    invocation. Two formats have been observed in the wild: the plain literal (e.g. exactly
+    "/compact", when typed directly or sent via cmux) and the XML-wrapped one (e.g.
+    "<command-name>/compact</command-name>\\n  <command-message>...", seen when the CLI
+    captures command output). Exact/startswith only — never "in" — to avoid false-triggering
+    on text that merely mentions the command, e.g. a compaction summary describing this
+    very feature."""
+    return text == name or text.startswith(name + " ") or text.startswith(f"<command-name>{name}</command-name>")
+
+
 def duration_str(secs: float) -> str:
     """Compact duration like '42s', '5m', '3h 20m', '2d 4h'."""
     secs = max(0, secs)
@@ -313,18 +324,14 @@ class SessionState:
                 msg = d.get("message")
                 if not isinstance(msg, dict):
                     continue
-                # A real slash-command invocation is the ENTIRE message content, nothing else —
-                # e.g. exactly "<command-name>/clear</command-name>\n  <command-message>...".
-                # Checking startswith (not "in") avoids false-triggering on text that merely
-                # mentions the marker, e.g. a compaction summary describing this very feature.
                 msg_text_stripped = _msg_text(msg).strip() if d.get("type") == "user" else ""
-                if msg_text_stripped.startswith("<command-name>/clear</command-name>"):
+                if _is_slash_command(msg_text_stripped, "/clear"):
                     # /clear resets the model's context immediately, but the dashboard only learns
                     # the new (near-zero) size from the NEXT turn's usage stats — same lag as the
                     # real context itself. Reset our own counters now so the display isn't stuck
                     # showing the pre-clear numbers in the meantime.
                     self._reset_for_clear()
-                if msg_text_stripped.startswith("<command-name>/compact</command-name>"):
+                if _is_slash_command(msg_text_stripped, "/compact"):
                     # /compact rewrites history into a summary, but (unlike /clear) we have no way
                     # to know the new context size until the next real usage entry arrives — mark
                     # the current numbers as stale/pending instead of guessing or leaving them look
