@@ -49,7 +49,7 @@ python3 claude_live_dashboard.py
 | `↑` / `↓` | Select a session row |
 | `Enter` / `g` | Jump to that session's tab (requires cmux) |
 | `c` | Send `/clear` to the selected session (asks `y/N`; queues if the session is busy) |
-| `k` | Send `/compact` to the selected session (asks `y/N`; queues if the session is busy) |
+| `k` | Send `/compact` to the selected session (asks `y/N`; queues if the session is busy), followed by a trivial `ok` so CTX/%LIM refresh right away instead of staying stale until the session's next real turn |
 | `x` | Close (terminate) the selected session (asks `y/N`). Closes its cmux tab if it has one, otherwise sends `SIGTERM` directly. Refused for Claude Desktop sessions — close those from the Desktop app itself. |
 | `n` | Launch a new session: type a name, pick a model (`sonnet`/`opus`/`fable`) with `↑`/`↓`, Enter to launch. Opens a new cmux tab running `claude --model <model> --permission-mode auto`, then renames it. |
 | `r` | Rename the selected session: prefilled with its current name, editable, Enter sends `/rename` |

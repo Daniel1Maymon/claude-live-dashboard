@@ -1085,6 +1085,14 @@ def draw(stdscr):
                     cmd = "/clear" if pending_confirm["action"] == "clear" else "/compact"
                     if sid in states:
                         ok, msg = cmux_send_command(sid, cmd)
+                        if ok and cmd == "/compact":
+                            # /compact alone never produces a countable usage entry (see
+                            # compact_pending above), so CTX/%LIM would stay stale until
+                            # whatever real turn happens next — which could be a long time.
+                            # A trivial follow-up forces that turn right away; cmux queues it
+                            # while the session is still busy compacting, so it lands the
+                            # moment compaction finishes.
+                            cmux_send_command(sid, "ok")
                         set_status(f"{cmd} -> {states[sid].name}: {msg}" if ok else f"Failed: {msg}", ok)
                 pending_confirm = None
             elif c != -1:
