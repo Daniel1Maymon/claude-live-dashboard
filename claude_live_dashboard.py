@@ -546,15 +546,50 @@ def close_session(session_id: str, pid: int, entrypoint):
     return True, f"Sent SIGTERM to pid {pid} (not in a cmux pane)"
 
 
-def cmux_send_command(session_id: str, text: str):
-    loc = cmux_find_surface(session_id)
-    if not loc:
-        return False, "Not found in cmux (not running in a cmux pane, or already closed)"
-    ws, sf = loc["workspace_ref"], loc["surface_ref"]
-    # `send` just types at the current cursor position — it does NOT clear existing input.
-    # If the box already had leftover text (e.g. an untyped/aborted command), our text would
-    # just get appended onto it (observed: sending "/clear" produced "/clear/clear" because
-    # the box already had "/clear" sitting in it). Clear the line both directions first.
+NEW_SESSION_MODELS = ["sonnet", "opus", "fable"]  # CLI aliases for --model, always the latest of each
+
+
+def launch_new_session(name: str, model: str):
+    """Open a new cmux tab running `claude --model <model>` and rename it. The CLI has no --name
+    flag, so we start it plain and send /rename once it's up — the same slash command a user
+    would type themselves. We target the pane directly by the workspace/surface refs
+    `new-workspace` hands back, NOT through cmux_find_surface's session-UUID matching: that
+    matching relies on a "resume binding" cmux only sets for panes it launches as its own tracked
+    agent session — confirmed by polling a real running session for 20+ seconds after a
+    --command launch and it never appearing, a real limitation of this launch path, not a
+    timing race. Best-effort: if the rename send fails, the tab is still open and running, just
+    under its own auto-derived default name."""
+    cwd = os.getcwd()
+    ok, out = cmux_run(
+        "new-workspace", "--name", name, "--cwd", cwd,
+        "--command", f"claude --model {model}",
+    )
+    if not ok:
+        return False, f"new-workspace failed: {out}"
+    ws_match = CMUX_WS_RE.search(out)
+    if not ws_match:
+        return True, f"Launched '{name}' ({model}) — opened but couldn't parse its workspace ref to rename"
+    ws = ws_match.group(0)
+    ok, out = cmux_run("list-panels", "--workspace", ws)
+    sf_match = re.search(r"surface:\d+", out) if ok else None
+    if not sf_match:
+        return True, f"Launched '{name}' ({model}) — opened but couldn't find its pane to rename"
+    sf = sf_match.group(0)
+    # Give Claude Code a moment to actually start and reach its input prompt before typing into
+    # it — too soon and the keys land on its startup screen instead of the conversation.
+    time.sleep(3)
+    ok2, msg2 = _cmux_send_to(ws, sf, f"/rename {name}")
+    if not ok2:
+        return True, f"Launched '{name}' ({model}) — but rename failed: {msg2}"
+    return True, f"Launched '{name}' ({model})"
+
+
+def _cmux_send_to(ws: str, sf: str, text: str):
+    """Type `text` into a specific cmux pane (already-known workspace/surface refs) and press
+    Enter. `send` just types at the current cursor position — it does NOT clear existing input.
+    If the box already had leftover text (e.g. an untyped/aborted command), our text would just
+    get appended onto it (observed: sending "/clear" produced "/clear/clear" because the box
+    already had "/clear" sitting in it). Clear the line both directions first."""
     ok, msg = cmux_run("send-key", "--workspace", ws, "--surface", sf, "ctrl+u")
     if not ok:
         return False, f"clear-line failed: {msg}"
@@ -568,6 +603,13 @@ def cmux_send_command(session_id: str, text: str):
     if not ok:
         return False, f"enter failed: {msg}"
     return True, f"Sent {text}"
+
+
+def cmux_send_command(session_id: str, text: str):
+    loc = cmux_find_surface(session_id)
+    if not loc:
+        return False, "Not found in cmux (not running in a cmux pane, or already closed)"
+    return _cmux_send_to(loc["workspace_ref"], loc["surface_ref"], text)
 
 
 def draw(stdscr):
@@ -602,7 +644,8 @@ def draw(stdscr):
     status_msg = ""
     status_ok = True
     status_expiry = 0.0
-    pending_confirm = None  # {"action": "clear"|"compact", "sid": ...}
+    pending_confirm = None  # {"action": "clear"|"compact"|"close", "sid": ...}
+    new_session = None  # None, or {"stage": "name"|"model", "name": str, "model_idx": int}
     show_help = False
     prev_show_help = False
     stdscr.timeout(100)  # getch blocks up to 100ms — keeps nav responsive between data refreshes
@@ -656,6 +699,9 @@ def draw(stdscr):
         ("  x             close (terminate) this session (asks y/N). Closes its cmux tab if it has", 0),
         ("                one, otherwise sends SIGTERM directly. Refused for Claude Desktop sessions", 0),
         ("                — close those from the Desktop app itself.", 0),
+        ("  n             new session: type a name (Enter), pick a model with up/down (Enter to", 0),
+        ("                launch, Esc cancels either step). Opens a new cmux tab running", 0),
+        ("                `claude --model <model>`, then sends /rename once it's up.", 0),
         ("  PgUp/PgDn     scroll the tool list in the detail panel", 0),
         ("  ?             toggle this help", 0),
         ("  q             quit", 0),
@@ -724,9 +770,13 @@ def draw(stdscr):
 
         if resized.is_set():
             resized.clear()
-            curses.update_lines_cols()  # pulls the real current size from the terminal (ioctl),
-                                         # which getmaxyx() alone won't do on its own after SIGWINCH
-            stdscr.resize(curses.LINES, curses.COLS)
+            # curses.update_lines_cols() alone only refreshes the Python-level LINES/COLS
+            # globals — it does NOT resize the actual stdscr WINDOW struct, so getmaxyx() below
+            # kept returning the OLD size regardless (verified: the naive update_lines_cols()-only
+            # version still corrupted the screen on resize). curses.resizeterm() is the real fix —
+            # it's what actually reallocates/resizes the window structures ncurses tracks.
+            new_x, new_y = os.get_terminal_size()
+            curses.resizeterm(new_y, new_x)
             stdscr.clear()
         elif show_help != prev_show_help:
             stdscr.clear()  # full repaint on transition — erase() alone can leave stale cells behind
@@ -757,7 +807,7 @@ def draw(stdscr):
 
         safe_addstr(
             stdscr, 0, 0,
-            f"Claude Code — {len(states)} running, sorted by last message  [↑/↓ select, Enter/g cmux, c clear, k compact, x close, ? help, q quit]"[: w_ - 1],
+            f"Claude Code — {len(states)} running, sorted by last message  [↑/↓ select, Enter/g cmux, c clear, k compact, x close, n new, ? help, q quit]"[: w_ - 1],
         )
 
         usage_text, usage_worst = usage_line_parts(usage_state)
@@ -769,7 +819,14 @@ def draw(stdscr):
             usage_attr = DIM
         safe_addstr(stdscr, 1, 0, usage_text[: w_ - 1], usage_attr)
 
-        if pending_confirm and pending_confirm["action"] == "close":
+        if new_session is not None:
+            if new_session["stage"] == "name":
+                prompt = f"New session — name: {new_session['name']}_  (Enter to continue, Esc to cancel)"
+            else:
+                model = NEW_SESSION_MODELS[new_session["model_idx"]]
+                prompt = f"New session '{new_session['name']}' — model: [{model}]  (up/down to change, Enter to launch, Esc to cancel)"
+            safe_addstr(stdscr, 2, 0, prompt[: w_ - 1], curses.A_BOLD | GREEN)
+        elif pending_confirm and pending_confirm["action"] == "close":
             sel = states.get(pending_confirm["sid"])
             sel_name = sel.name if sel else "?"
             safe_addstr(
@@ -924,6 +981,32 @@ def draw(stdscr):
 
         c = stdscr.getch()
 
+        if new_session is not None:
+            if c == 27:  # Esc
+                new_session = None
+                set_status("Cancelled.", True)
+            elif new_session["stage"] == "name":
+                if c in (10, 13, curses.KEY_ENTER):
+                    if new_session["name"].strip():
+                        new_session["stage"] = "model"
+                        new_session["model_idx"] = 0
+                    # else: empty name — stay on this field, Enter does nothing
+                elif c in (127, curses.KEY_BACKSPACE, 8):
+                    new_session["name"] = new_session["name"][:-1]
+                elif 32 <= c <= 126 and len(new_session["name"]) < 40:
+                    new_session["name"] += chr(c)
+            else:  # stage == "model"
+                if c in (curses.KEY_UP, curses.KEY_DOWN):
+                    delta = -1 if c == curses.KEY_UP else 1
+                    new_session["model_idx"] = (new_session["model_idx"] + delta) % len(NEW_SESSION_MODELS)
+                elif c in (10, 13, curses.KEY_ENTER):
+                    name = new_session["name"].strip()
+                    model = NEW_SESSION_MODELS[new_session["model_idx"]]
+                    ok, msg = launch_new_session(name, model)
+                    set_status(msg, ok)
+                    new_session = None
+            continue
+
         if pending_confirm is not None:
             if c in (ord("y"), ord("Y")):
                 sid = pending_confirm["sid"]
@@ -970,6 +1053,8 @@ def draw(stdscr):
             pending_confirm = {"action": "compact", "sid": selected_sid}
         elif c in (ord("x"), ord("X")) and selected_sid in states:
             pending_confirm = {"action": "close", "sid": selected_sid}
+        elif c in (ord("n"), ord("N")):
+            new_session = {"stage": "name", "name": ""}
 
 
 if __name__ == "__main__":
