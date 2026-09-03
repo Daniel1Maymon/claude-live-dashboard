@@ -550,9 +550,11 @@ NEW_SESSION_MODELS = ["sonnet", "opus", "fable"]  # CLI aliases for --model, alw
 
 
 def launch_new_session(name: str, model: str):
-    """Open a new cmux tab running `claude --model <model>` and rename it. The CLI has no --name
-    flag, so we start it plain and send /rename once it's up — the same slash command a user
-    would type themselves. We target the pane directly by the workspace/surface refs
+    """Open a new cmux tab running `claude --model <model> --permission-mode auto` and rename it.
+    --permission-mode auto means the new session runs without stopping for permission prompts —
+    intentional for a dashboard-launched session, matching what typing the command by hand would
+    do with that flag. The CLI has no --name flag, so we start it plain and send /rename once
+    it's up — the same slash command a user would type themselves. We target the pane directly by the workspace/surface refs
     `new-workspace` hands back, NOT through cmux_find_surface's session-UUID matching: that
     matching relies on a "resume binding" cmux only sets for panes it launches as its own tracked
     agent session — confirmed by polling a real running session for 20+ seconds after a
@@ -562,7 +564,7 @@ def launch_new_session(name: str, model: str):
     cwd = os.getcwd()
     ok, out = cmux_run(
         "new-workspace", "--name", name, "--cwd", cwd,
-        "--command", f"claude --model {model}",
+        "--command", f"claude --model {model} --permission-mode auto",
     )
     if not ok:
         return False, f"new-workspace failed: {out}"
@@ -646,6 +648,7 @@ def draw(stdscr):
     status_expiry = 0.0
     pending_confirm = None  # {"action": "clear"|"compact"|"close", "sid": ...}
     new_session = None  # None, or {"stage": "name"|"model", "name": str, "model_idx": int}
+    rename_state = None  # None, or {"sid": str, "name": str} while typing a new name for an existing session
     show_help = False
     prev_show_help = False
     stdscr.timeout(100)  # getch blocks up to 100ms — keeps nav responsive between data refreshes
@@ -701,7 +704,11 @@ def draw(stdscr):
         ("                — close those from the Desktop app itself.", 0),
         ("  n             new session: type a name (Enter), pick a model with up/down (Enter to", 0),
         ("                launch, Esc cancels either step). Opens a new cmux tab running", 0),
-        ("                `claude --model <model>`, then sends /rename once it's up.", 0),
+        ("                `claude --model <model> --permission-mode auto`, then sends /rename once", 0),
+        ("                it's up. --permission-mode auto means the new session won't stop to ask", 0),
+        ("                before running tools — same as launching it that way yourself.", 0),
+        ("  r             rename the selected session: type a new name (prefilled with the current", 0),
+        ("                one), Enter sends /rename, Esc cancels.", 0),
         ("  PgUp/PgDn     scroll the tool list in the detail panel", 0),
         ("  ?             toggle this help", 0),
         ("  q             quit", 0),
@@ -807,7 +814,7 @@ def draw(stdscr):
 
         safe_addstr(
             stdscr, 0, 0,
-            f"Claude Code — {len(states)} running, sorted by last message  [↑/↓ select, Enter/g cmux, c clear, k compact, x close, n new, ? help, q quit]"[: w_ - 1],
+            f"Claude Code — {len(states)} running, sorted by last message  [↑/↓ select, Enter/g cmux, c clear, k compact, x close, n new, r rename, ? help, q quit]"[: w_ - 1],
         )
 
         usage_text, usage_worst = usage_line_parts(usage_state)
@@ -819,7 +826,12 @@ def draw(stdscr):
             usage_attr = DIM
         safe_addstr(stdscr, 1, 0, usage_text[: w_ - 1], usage_attr)
 
-        if new_session is not None:
+        if rename_state is not None:
+            sel = states.get(rename_state["sid"])
+            old_name = sel.name if sel else "?"
+            prompt = f"Rename {old_name} to: {rename_state['name']}_  (Enter to send /rename, Esc to cancel)"
+            safe_addstr(stdscr, 2, 0, prompt[: w_ - 1], curses.A_BOLD | GREEN)
+        elif new_session is not None:
             if new_session["stage"] == "name":
                 prompt = f"New session — name: {new_session['name']}_  (Enter to continue, Esc to cancel)"
             else:
@@ -981,6 +993,24 @@ def draw(stdscr):
 
         c = stdscr.getch()
 
+        if rename_state is not None:
+            if c == 27:  # Esc
+                rename_state = None
+                set_status("Cancelled.", True)
+            elif c in (10, 13, curses.KEY_ENTER):
+                new_name = rename_state["name"].strip()
+                if new_name:
+                    sid = rename_state["sid"]
+                    ok, msg = cmux_send_command(sid, f"/rename {new_name}")
+                    set_status(f"Renamed -> {new_name}: {msg}" if ok else f"Failed: {msg}", ok)
+                    rename_state = None
+                # else: empty name — stay open, Enter does nothing
+            elif c in (127, curses.KEY_BACKSPACE, 8):
+                rename_state["name"] = rename_state["name"][:-1]
+            elif 32 <= c <= 126 and len(rename_state["name"]) < 40:
+                rename_state["name"] += chr(c)
+            continue
+
         if new_session is not None:
             if c == 27:  # Esc
                 new_session = None
@@ -1055,6 +1085,8 @@ def draw(stdscr):
             pending_confirm = {"action": "close", "sid": selected_sid}
         elif c in (ord("n"), ord("N")):
             new_session = {"stage": "name", "name": ""}
+        elif c in (ord("r"), ord("R")) and selected_sid in states:
+            rename_state = {"sid": selected_sid, "name": states[selected_sid].name}
 
 
 if __name__ == "__main__":
