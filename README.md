@@ -63,7 +63,7 @@ python3 claude_live_dashboard.py
 |---|---|
 | `NAME` | Session name. If two sessions share a name (e.g. both renamed `#1`), the PID is appended (`name·pid`) so they're never indistinguishable. |
 | `STATUS` | `idle`, `busy` (generating), `shell` (running a command), `waiting` (blocked on a permission dialog), or `desktop`/`desktop~active` for Claude Desktop sessions (which don't report a real status — this is a best-effort transcript-recency guess instead) |
-| `BAR` | An animated activity indicator while a `/compact` sent from the dashboard is still in flight. There's no real progress percentage available anywhere (Claude Code doesn't expose one) — this is deliberately just a "still working" indicator, not a measured fill. |
+| `BAR` | An animated activity indicator while `/compact` is actively running (status `busy`) for a session that's mid-compaction. There's no real progress percentage available anywhere (Claude Code doesn't expose one) — this is deliberately just a "still working" indicator, not a measured fill, and it clears the moment status leaves `busy` even if `CTX` is still showing stale (see `CTX`). |
 | `MODEL` | Model of the last real turn (Sonnet/Opus/Fable). Skips Claude Code's own `<synthetic>` placeholder turns that never actually called a model. |
 | `CTX` | Context size of the *last* turn only (cache read + cache creation + input tokens). A trailing `?` means `/compact` ran but there's been no turn since, so the number is stale. |
 | `%LIM` | `CTX` as a percentage of *this session's model's* real context window (1M for Sonnet/Opus/Fable 5, 200K default otherwise) — the number to actually watch for compacting. Yellow at 60%, red at 85%. |

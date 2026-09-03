@@ -942,7 +942,7 @@ def draw(stdscr):
             vals = [
                 display_name,
                 st.status,
-                compacting_bar() if st.compact_pending else "",
+                compacting_bar() if st.compact_pending and st.status == "busy" else "",
                 (st.model or "?").replace("claude-", ""),
                 f"{fmt_k(st.context_tokens)}?" if st.compact_pending else fmt_k(st.context_tokens),
                 "?" if st.compact_pending else (
