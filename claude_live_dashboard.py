@@ -322,6 +322,22 @@ class SessionState:
                             )
                         except ValueError:
                             pass
+                if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
+                    # The authoritative compaction signal, written for EVERY compaction —
+                    # manual (/compact) or automatic (the CLI compacts on its own once context
+                    # nears the model's limit, with no /compact message in the transcript at
+                    # all). Counting only a typed "/compact" missed every auto-compact entirely.
+                    self.compact_count += 1
+                    meta = d.get("compactMetadata") or {}
+                    post_tokens = meta.get("postTokens")
+                    if post_tokens is not None:
+                        # We now know the real post-compaction size immediately, so there's no
+                        # need to show stale CTX/%LIM until the next real turn's usage entry.
+                        self.last_input_tokens = post_tokens
+                        self.last_cache_read = 0
+                        self.last_cache_creation = 0
+                        self.has_usage = True
+                    self.compact_pending = False
                 msg = d.get("message")
                 if not isinstance(msg, dict):
                     continue
@@ -333,12 +349,14 @@ class SessionState:
                     # showing the pre-clear numbers in the meantime.
                     self._reset_for_clear()
                 if _is_slash_command(msg_text_stripped, "/compact"):
-                    # /compact rewrites history into a summary, but (unlike /clear) we have no way
-                    # to know the new context size until the next real usage entry arrives — mark
-                    # the current numbers as stale/pending instead of guessing or leaving them look
-                    # accurate.
+                    # A /compact request was just sent — mark CTX/%LIM stale as immediate visual
+                    # feedback. The compact_boundary handler above corrects/clears this once
+                    # compaction actually finishes. Auto-compact has no equivalent "starting now"
+                    # marker to set this early (Claude Code doesn't expose one anywhere this
+                    # dashboard can poll), so the BAR animation only ever appears for a compact
+                    # sent from here, never for an auto-compact — that's a real limitation, not
+                    # a bug to chase further.
                     self.compact_pending = True
-                    self.compact_count += 1
                 # "<synthetic>" is a real value Claude Code itself writes for a placeholder
                 # assistant turn that never actually called a model (e.g. "No response requested.",
                 # zeroed usage) — skip it so MODEL keeps showing the last turn that really ran.
@@ -491,18 +509,62 @@ CMUX_SURFACE_BOTH_RE = re.compile(r"(surface:\d+)\s+([0-9A-Fa-f-]{36})")
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
-def cmux_find_surface(session_id: str):
-    """Find the cmux pane running this Claude session.
+def cmux_find_surface_by_pid(pid: int):
+    """Find the cmux surface actually running this pid as its live top-level process, via
+    `cmux top --processes` (the real process tree cmux itself reports).
 
-    cmux's own --resume marker (shown by `surface resume get`) embeds the same
-    session UUID Claude Code uses, so we match on that. Two CLI quirks drove this
-    implementation: `cmux rpc <method> '{...}'` silently ignores workspace/surface
-    scoping in its JSON body and always operates on the CALLING shell's own pane
-    (so we use the purpose-built subcommands, which honor --workspace/--surface
-    flags correctly) — and the `surface.focus` RPC needs a real UUID, not the
-    short "surface:N" ref, hence the --id-format both lookup.
+    This exists because `surface resume get`'s --resume UUID (used by the fallback below) is
+    just cmux's *restart* command for a pane, and can be stale/duplicated: confirmed in practice
+    that two entirely different, unrelated-looking panes both carried an identical --resume
+    binding for the same session UUID, while only one of them actually had that session's pid
+    running. The live process tree doesn't have that ambiguity — a pid can only be resident in
+    one surface at a time — so when we know the session's pid, prefer this over UUID matching.
     Returns {workspace_ref, surface_ref, surface_uuid} or None.
     """
+    if not CMUX_BIN or not pid:
+        return None
+    ok, out = cmux_run("list-workspaces")
+    if not ok:
+        return None
+    target = str(pid)
+    for ws_ref in sorted(set(CMUX_WS_RE.findall(out))):
+        ok, top_out = cmux_run("top", "--workspace", ws_ref, "--processes", "--format", "tsv")
+        if not ok:
+            continue
+        for line in top_out.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 6 and parts[3] == "process" and parts[4] == target and parts[5].startswith("surface:"):
+                surface_ref = parts[5]
+                ok2, panels_out = cmux_run("list-panels", "--workspace", ws_ref, "--id-format", "both")
+                surface_uuid = ""
+                if ok2:
+                    for s_ref, s_uuid in CMUX_SURFACE_BOTH_RE.findall(panels_out):
+                        if s_ref == surface_ref:
+                            surface_uuid = s_uuid
+                            break
+                return {"workspace_ref": ws_ref, "surface_ref": surface_ref, "surface_uuid": surface_uuid}
+    return None
+
+
+def cmux_find_surface(session_id: str, pid: int = None):
+    """Find the cmux pane running this Claude session.
+
+    Prefers matching by live pid (see cmux_find_surface_by_pid) when the caller has one, since
+    that's ground truth. Falls back to cmux's own --resume marker (shown by `surface resume
+    get`), which embeds the same session UUID Claude Code uses — used when no pid is available,
+    or as a last resort if the pid isn't found in any surface's process tree (e.g. between
+    `top`'s snapshot and a pane that hasn't been polled yet). Two CLI quirks drove the
+    fallback's implementation: `cmux rpc <method> '{...}'` silently ignores workspace/surface
+    scoping in its JSON body and always operates on the CALLING shell's own pane (so we use the
+    purpose-built subcommands, which honor --workspace/--surface flags correctly) — and the
+    `surface.focus` RPC needs a real UUID, not the short "surface:N" ref, hence the --id-format
+    both lookup.
+    Returns {workspace_ref, surface_ref, surface_uuid} or None.
+    """
+    if pid:
+        loc = cmux_find_surface_by_pid(pid)
+        if loc:
+            return loc
     if not CMUX_BIN:
         return None
     ok, out = cmux_run("list-workspaces")
@@ -522,8 +584,8 @@ def cmux_find_surface(session_id: str):
     return None
 
 
-def cmux_navigate(session_id: str):
-    loc = cmux_find_surface(session_id)
+def cmux_navigate(session_id: str, pid: int = None):
+    loc = cmux_find_surface(session_id, pid)
     if not loc:
         return False, "Not found in cmux (not running in a cmux pane, or already closed)"
     # `rpc surface.focus` looks like the right tool (it's what a JSON body targeting a specific
@@ -552,7 +614,7 @@ def close_session(session_id: str, pid: int, entrypoint):
     back to a direct SIGTERM for headless sessions (e.g. sdk-cli) with no pane to close."""
     if entrypoint == "claude-desktop":
         return False, "Can't close a Claude Desktop session from here — close it in the Desktop app itself"
-    loc = cmux_find_surface(session_id)
+    loc = cmux_find_surface(session_id, pid)
     if loc:
         ok, msg = cmux_run("close-surface", "--surface", loc["surface_ref"], "--workspace", loc["workspace_ref"])
         if ok:
@@ -641,8 +703,8 @@ def _cmux_send_to(ws: str, sf: str, text: str):
     return True, f"Sent {text}"
 
 
-def cmux_send_command(session_id: str, text: str):
-    loc = cmux_find_surface(session_id)
+def cmux_send_command(session_id: str, text: str, pid: int = None):
+    loc = cmux_find_surface(session_id, pid)
     if not loc:
         return False, "Not found in cmux (not running in a cmux pane, or already closed)"
     return _cmux_send_to(loc["workspace_ref"], loc["surface_ref"], text)
@@ -1086,7 +1148,8 @@ def draw(stdscr):
                 new_name = rename_state["name"].strip()
                 if new_name:
                     sid = rename_state["sid"]
-                    ok, msg = cmux_send_command(sid, f"/rename {new_name}")
+                    rename_pid = states[sid].pid if sid in states else None
+                    ok, msg = cmux_send_command(sid, f"/rename {new_name}", rename_pid)
                     set_status(f"Renamed -> {new_name}: {msg}" if ok else f"Failed: {msg}", ok)
                     rename_state = None
                 # else: empty name — stay open, Enter does nothing
@@ -1162,7 +1225,7 @@ def draw(stdscr):
                     if len(sids) == 1:
                         sid = sids[0]
                         if sid in states:
-                            ok, msg = cmux_send_command(sid, cmd)
+                            ok, msg = cmux_send_command(sid, cmd, states[sid].pid)
                             if ok and cmd == "/compact":
                                 # /compact alone never produces a countable usage entry (see
                                 # compact_pending above), so CTX/%LIM would stay stale until
@@ -1171,18 +1234,18 @@ def draw(stdscr):
                                 # while the session is still busy compacting, so it lands the
                                 # moment compaction finishes. Asking for a single character keeps
                                 # the forced turn's own output as cheap as possible.
-                                cmux_send_command(sid, "write a dot (.)")
+                                cmux_send_command(sid, "write a dot (.)", states[sid].pid)
                             set_status(f"{cmd} -> {states[sid].name}: {msg}" if ok else f"Failed: {msg}", ok)
                     else:
                         sent, failed = 0, 0
                         for sid in sids:
                             if sid not in states:
                                 continue
-                            ok, _ = cmux_send_command(sid, cmd)
+                            ok, _ = cmux_send_command(sid, cmd, states[sid].pid)
                             if ok:
                                 sent += 1
                                 if cmd == "/compact":
-                                    cmux_send_command(sid, "write a dot (.)")
+                                    cmux_send_command(sid, "write a dot (.)", states[sid].pid)
                             else:
                                 failed += 1
                         set_status(
@@ -1216,7 +1279,8 @@ def draw(stdscr):
         elif c == curses.KEY_PPAGE:
             tool_scroll = max(0, tool_scroll - 5)
         elif c in (10, 13, curses.KEY_ENTER, ord("g"), ord("G")) and selected_sid:
-            ok, msg = cmux_navigate(selected_sid)
+            nav_pid = states[selected_sid].pid if selected_sid in states else None
+            ok, msg = cmux_navigate(selected_sid, nav_pid)
             set_status(msg, ok)
         elif c in (ord("c"), ord("C")) and target_sids():
             pending_confirm = {"action": "clear", "sids": target_sids()}
