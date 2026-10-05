@@ -610,7 +610,8 @@ def close_session(session_id: str, pid: int, entrypoint):
     per session, confirmed 1:1 by every session file checked), we've never verified a Desktop
     pid isn't shared across multiple conversations in the same app instance — killing it could
     take down more than the one you asked to close. For everything else, close its cmux pane
-    if it has one (the clean path — closing the tab is what a user would do by hand), falling
+    if it has one (the clean path — closing the tab is what a user would do by hand), or its
+    whole workspace when it's that workspace's only tab (cmux won't close a last tab), falling
     back to a direct SIGTERM for headless sessions (e.g. sdk-cli) with no pane to close."""
     if entrypoint == "claude-desktop":
         return False, "Can't close a Claude Desktop session from here — close it in the Desktop app itself"
@@ -619,6 +620,14 @@ def close_session(session_id: str, pid: int, entrypoint):
         ok, msg = cmux_run("close-surface", "--surface", loc["surface_ref"], "--workspace", loc["workspace_ref"])
         if ok:
             return True, f"Closed {loc['workspace_ref']} / {loc['surface_ref']} in cmux"
+        # cmux refuses to close a workspace's only tab ("invalid_state: Cannot close the last
+        # surface"). In that case the workspace holds nothing but this session, so closing the
+        # whole workspace is the same as closing the tab.
+        if "last surface" in msg:
+            ok, msg = cmux_run("close-workspace", "--workspace", loc["workspace_ref"])
+            if ok:
+                return True, f"Closed {loc['workspace_ref']} in cmux (session was its only tab)"
+            return False, f"close-workspace failed: {msg}"
         return False, f"close-surface failed: {msg}"
     if not pid:
         return False, "No pid on record for this session"
@@ -1204,11 +1213,12 @@ def draw(stdscr):
                                     selected_sid = None
                     else:
                         closed, failed = 0, 0
+                        first_failure = None
                         for sid in sids:
                             if sid not in states:
                                 continue
                             st = states[sid]
-                            ok, _ = close_session(sid, st.pid, st.entrypoint)
+                            ok, msg = close_session(sid, st.pid, st.entrypoint)
                             if ok:
                                 closed += 1
                                 del states[sid]
@@ -1216,8 +1226,11 @@ def draw(stdscr):
                                     selected_sid = None
                             else:
                                 failed += 1
+                                if first_failure is None:
+                                    first_failure = f"{st.name}: {msg}"
                         set_status(
-                            f"Closed {closed}/{len(sids)} session(s)" + (f", {failed} failed" if failed else ""),
+                            f"Closed {closed}/{len(sids)} session(s)"
+                            + (f", {failed} failed (first: {first_failure})" if failed else ""),
                             failed == 0,
                         )
                 else:
