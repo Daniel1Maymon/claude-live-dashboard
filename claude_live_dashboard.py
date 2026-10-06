@@ -265,10 +265,18 @@ class SessionState:
         self.compact_pending = False  # True from a /compact marker until the next real usage entry
         self.compact_count = 0  # lifetime count of /compact commands sent in this session
         self.last_msg_ts_ms = None
-        self.created_ms = None
+        self.first_msg_ts_ms = None  # first user/assistant turn in the transcript = real conversation start
+        self.created_ms = None  # process start (registry startedAt) - resets on every --resume/reboot
         self.last_tool = None
         self.tool_errors = 0
         self.recent_tools = deque(maxlen=8)
+
+    @property
+    def conversation_start_ms(self):
+        """When the conversation began: its first user/assistant turn, which survives a --resume
+        or reboot and moves with /clear (that starts a new transcript). Falls back to the process
+        start for a session that has no turns yet."""
+        return self.first_msg_ts_ms if self.first_msg_ts_ms is not None else self.created_ms
 
     def _find_path(self):
         if self.path and self.path.exists():
@@ -320,6 +328,8 @@ class SessionState:
                                 datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
                                 * 1000
                             )
+                            if self.first_msg_ts_ms is None:
+                                self.first_msg_ts_ms = self.last_msg_ts_ms
                         except ValueError:
                             pass
                 if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
@@ -798,8 +808,8 @@ def draw(stdscr):
         ("  !          Number of active warnings (see the detail panel below for what they are).", 0),
         ("  CMPCT      Lifetime count of /compact commands sent in this session. '-' = never.", 0),
         ("  LAST MSG   Time since the last real conversation turn (not process uptime).", 0),
-        ("  CREATED    Time since this terminal/process started (can predate LAST MSG on a", 0),
-        ("             --resume'd conversation, or postdate it right after a /clear).", 0),
+        ("  CREATED    Time since the conversation's first message (kept across --resume and", 0),
+        ("             reboots; resets on /clear). Process start time until the first message.", 0),
         ("", 0),
         ("Keys", curses.A_BOLD),
         ("  up/down       select a row", 0),
@@ -1059,7 +1069,7 @@ def draw(stdscr):
                 str(len(warn)) if warn else "-",
                 str(st.compact_count) if st.compact_count else "-",
                 ago_str(st.last_msg_ts_ms) if st.last_msg_ts_ms else "-",
-                ago_str(st.created_ms) if st.created_ms else "-",
+                ago_str(st.conversation_start_ms) if st.conversation_start_ms else "-",
             ]
             x = 0
             for val, cw in zip(vals, widths):
@@ -1089,7 +1099,8 @@ def draw(stdscr):
                 DIM,
             )
             drow += 1
-            created = f"{abs_str(sel.created_ms)} ({ago_str(sel.created_ms)} ago)" if sel.created_ms else "?"
+            start_ms = sel.conversation_start_ms
+            created = f"{abs_str(start_ms)} ({ago_str(start_ms)} ago)" if start_ms else "?"
             last_msg = f"{abs_str(sel.last_msg_ts_ms)} ({ago_str(sel.last_msg_ts_ms)} ago)" if sel.last_msg_ts_ms else "no messages yet"
             safe_addstr(stdscr, drow, 0, f"created: {created}   last message: {last_msg}"[: w_ - 1], DIM)
             drow += 1
